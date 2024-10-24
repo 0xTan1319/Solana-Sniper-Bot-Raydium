@@ -1,4 +1,4 @@
-# Advanced Solana Token Sniper
+# Raydium Sniper Bot on Solana V2
 
 ## Overview
 
