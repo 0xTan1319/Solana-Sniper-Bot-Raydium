@@ -1,166 +1,92 @@
 import dotenv from "dotenv";
 import path from "path";
 import { Connection, Keypair } from "@solana/web3.js";
-import bs58 from "bs58";
-
-import { Currency, CurrencyAmount, LiquidityPoolKeysV4, TokenAmount } from "@raydium-io/raydium-sdk";
-import BN, { min } from "bn.js";
-import {
-	checkSolBalance,
-	getTokenMetadataInfo,
-	initializeConfigurations,
-	logErrorToFile,
-	promptUserConfiguration,
-	rugCheck,
-	setupSnipeListMonitoring,
-	sleep,
-	storeData,
-} from "./utils";
-import base58 from "bs58";
-import {
-	BUY_AMOUNT_SOL,
-	BUY_DELAY,
-	CHECK_TOKEN_SYMBOL,
-	ENABLE_RUG_CHECKS,
-	MAX_SINGLE_OWNER_PERCENTAGE,
-	MAX_SOL_LP,
-	MIN_SOL_LP,
-	MIN_SOL_REQUIRED,
-	MIN_TOKEN_LP_PERCENTAGE,
-	TOKEN_SYMBOL_FILTER,
-	USE_PENDING_SNIPE_LIST,
-	logger,
-	rayFee,
-	sniperWallet,
-	solanaConnection,
-} from "./constants";
-import { buyToken, extractMarketAndLpInfoFromLogs, getPoolKeysFromMarketId } from "./swapUtils";
+import { LiquidityPoolKeysV4 } from "@raydium-io/raydium-sdk";
+import { initializeConfigurations, setupSnipeListMonitoring, sleep, getTokenMetadataInfo } from "./utils";
+import { logger, TOKEN_SYMBOL_FILTER, USE_PENDING_SNIPE_LIST, CHECK_TOKEN_SYMBOL } from "./constants";
+import { extractMarketAndLpInfoFromLogs, getPoolKeysFromMarketId } from "./swapUtils";
 
 dotenv.config();
 
-/**storage */
-const newDataPath = path.join(__dirname, "sniper_data", "bought_tokens.json");
-
-const seenSignatures = new Set<string>();
-
+let seenSignatures = new Set<string>();
 let pendingSnipeList: string[] = [];
+const tokenSymbolToSnipe = TOKEN_SYMBOL_FILTER.toLowerCase();
 
-let tokenSymbolToSnipe = TOKEN_SYMBOL_FILTER.toLowerCase();
+const monitorNewTokens = async (connection: Connection, sniperWallet: Keypair) => {
+    try {
+        await initializeConfigurations();
+        setupSnipeListMonitoring(pendingSnipeList, logger);
+        logger.info(`Monitoring new Solana tokens...`);
 
-async function monitorNewTokens(connection: Connection, sniperWallet: Keypair) {
-	try {
-		await initializeConfigurations();
-		setupSnipeListMonitoring(pendingSnipeList, logger);
+        connection.onLogs("all", async ({ logs, err, signature }) => {
+            if (err || seenSignatures.has(signature)) return;
 
-		logger.info(`monitoring new solana tokens...`);
+            logger.info(`Found new token signature: ${signature}`);
+            seenSignatures.add(signature);
 
-		connection.onLogs(
-			rayFee,
-			async ({ logs, err, signature }) => {
-				try {
-					const websocketRecievedTimestamp = new Date().toISOString();
+            try {
+                const parsedTransaction = await connection.getParsedTransaction(signature, {
+                    maxSupportedTransactionVersion: 0,
+                    commitment: "confirmed",
+                });
 
-					const websocketReceivedTime = Math.floor(new Date().getTime() / 1000);
+                if (!parsedTransaction || parsedTransaction.meta?.err) return;
+                logger.info(`Parsed transaction for signature: ${signature}`);
 
-					if (err) {
-						return;
-					}
-					if (seenSignatures.has(signature)) {
-						return;
-					}
+                const lpInfo = extractMarketAndLpInfoFromLogs(logs);
+                const poolKeys: LiquidityPoolKeysV4 | null = await getPoolKeysFromMarketId(lpInfo.marketId, connection);
 
-					logger.info(`found new token signature: ${signature}`);
+                if (!poolKeys) {
+                    logger.error(`Unable to extract pool keys for signature: ${signature}`);
+                    return;
+                }
 
-					let signer = "";
-					let poolKeys: LiquidityPoolKeysV4 & {
-						poolOpenTime: any;
-					};
+                const poolOpenTime = parseInt(poolKeys.poolOpenTime.toString());
+                const currentTime = Math.floor(Date.now() / 1000);
 
-					/**You need to use a RPC provider for getparsedtransaction to work properly.
-					 * Check README.md for suggestions.
-					 */
-					const parsedTransaction = await connection.getParsedTransaction(signature, {
-						maxSupportedTransactionVersion: 0,
-						commitment: "confirmed",
-					});
+                const isPendingPool = USE_PENDING_SNIPE_LIST && pendingSnipeList.includes(poolKeys.baseMint.toString());
 
-					if (parsedTransaction && parsedTransaction?.meta.err == null) {
-						logger.info(`successfully parsed transaction for signature: ${signature}`);
+                if (!isPendingPool) {
+                    const tokenMetadata = await retrieveTokenMetadata(connection, poolKeys.baseMint.toString());
+                    if (!tokenMetadata) return;
 
-						signer = parsedTransaction?.transaction.message.accountKeys[0].pubkey.toString();
-
-						const lpInfo = extractMarketAndLpInfoFromLogs(logs);
-
-						/**extract pool keys */
-
-						poolKeys = await getPoolKeysFromMarketId(lpInfo.marketId, connection);
-
-						if (!poolKeys) {
-							throw new Error(`unable to extract poolkeys for signature: ${signature}`);
-						}
-
-						const initPoolBlockTime = parsedTransaction?.blockTime;
-
-						const poolOpenTime = parseInt(poolKeys.poolOpenTime.toString());
-
-						logger.info(
-							`pool open time: ${poolOpenTime}. websocket received time: ${websocketReceivedTime}. open time later than websocket received time?: ${
-								poolOpenTime > websocketReceivedTime
-							}`
-						);
-
-						if (!USE_PENDING_SNIPE_LIST) {
-							if (poolOpenTime > websocketReceivedTime) {
-								logger.info(
-									`Open time of pool ${lpInfo.openTime} is later than websocket received time ${websocketReceivedTime} for mint: ${poolKeys.baseMint}. Exiting the function.`
-								);
-								return;
-							}
-						}
-
-						//check if token is in snipe list
-						if (USE_PENDING_SNIPE_LIST) {
-							logger.info(`current pending token list: ${pendingSnipeList}`);
-
-							if (pendingSnipeList.includes(poolKeys.baseMint.toString())) {
-								logger.info(`Found token ${poolKeys.baseMint.toString()} in pending snipe list.`);
-
-								const currentTime = Math.floor(new Date().getTime() / 1000);
-								const delayMs = (poolOpenTime - currentTime) * 1000;
-
-								//check if pool open time is in the future
-								if (delayMs > 0) {
-									logger.info(`Pool open time is in the future for ${poolKeys.baseMint.toString()}. Delaying txn until pool open time for ${delayMs / 1000} seconds.`);
-									await sleep(delayMs);
-									logger.info(`Pool open time delay complete for ${poolKeys.baseMint.toString()}. Executing rest of function now...`);
-								}
-							} else if (CHECK_TOKEN_SYMBOL) {
-								const tokenMetadataInfo = await getTokenMetadataInfo(connection, poolKeys.baseMint.toString());
-
-								if (tokenMetadataInfo && tokenMetadataInfo.symbol) {
-									if (tokenMetadataInfo.symbol.toLowerCase() === tokenSymbolToSnipe) {
-										logger.info(`Found token ${poolKeys.baseMint.toString()} with symbol ${tokenMetadataInfo.symbol} in pending snipe list.`);
-									} else {
-										logger.info(`Skipping token ${poolKeys.baseMint.toString()}. Token symbol ${tokenMetadataInfo.symbol} does not match ${tokenSymbolToSnipe}.`);
-										return;
-									}
-								} else {
-									logger.info(`Skipping token ${poolKeys.baseMint.toString()}. Unable to retrieve the Token symbol info.`);
-									return;
-								}
-							} else {
-								logger.info(`Skipping token ${poolKeys.baseMint.toString()}. Not in pending snipe list.`);
-								return;
-							}
-						}
-
+                    const matchTokenSymbol = CHECK_TOKEN_SYMBOL && tokenMetadata.symbol.toLowerCase() === tokenSymbolToSnipe;
+                    if (!matchTokenSymbol) {
+                        logger.info(`Skipping token ${poolKeys.baseMint}. Symbol doesn't match filter.`);
+                        return;
                     }
                 }
+
+                if (poolOpenTime > currentTime) {
+                    const delayMs = (poolOpenTime - currentTime) * 1000;
+                    logger.info(`Delaying transaction for ${delayMs / 1000} seconds until pool open time.`);
+                    await sleep(delayMs);
+                }
+
+                logger.info(`Executing actions for token ${poolKeys.baseMint}...`);
+                // Additional logic to interact with the token can be added here
+
+            } catch (error) {
+                logger.error(`Error monitoring token: ${error.message}`, error);
             }
-
+        });
+    } catch (error) {
+        logger.error(`Critical error starting token monitoring: ${error.message}`, error);
     }
-}
+};
 
-monitorNewTokens();
+const retrieveTokenMetadata = async (connection: Connection, baseMint: string) => {
+    try {
+        const tokenMetadata = await getTokenMetadataInfo(connection, baseMint);
+        if (!tokenMetadata || !tokenMetadata.symbol) {
+            logger.info(`Unable to retrieve metadata for token ${baseMint}. Skipping.`);
+            return null;
+        }
+        return tokenMetadata;
+    } catch (error) {
+        logger.error(`Failed to retrieve token metadata: ${error.message}`);
+        return null;
+    }
+};
 
-//discord.gg/solana-scripts
+export default monitorNewTokens;
